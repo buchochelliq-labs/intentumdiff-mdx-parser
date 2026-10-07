@@ -384,6 +384,8 @@ fn jsx_line(
                 for attr in &mut attrs {
                     if attr.position.start_line == tag.line {
                         attr.position.start_col += tag.col;
+                    }
+                    if attr.position.end_line == tag.line {
                         attr.position.end_col += tag.col;
                     }
                 }
@@ -603,6 +605,21 @@ mod tests {
     use super::*;
     use crate::exports::intentdiff::plugin::parser::Guest;
     use intentumdiff_plugin_sdk::testing as t;
+
+    #[test]
+    fn multiline_attribute_end_column_does_not_inherit_inline_start_offset() {
+        let tree: serde_json::Value =
+            serde_json::from_str(&parse_mdx("é <Card title=\"a\nb\"/> ")).unwrap();
+        let card = tree["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["node_type"] == "jsx_component")
+            .unwrap();
+        assert_eq!(card["children"][0]["position"]["start_col"], 9);
+        assert_eq!(card["children"][0]["position"]["end_line"], 1);
+        assert_eq!(card["children"][0]["position"]["end_col"], 2);
+    }
 
     #[test]
     fn attribute_words_and_expression_tails_remain_semantic() {
