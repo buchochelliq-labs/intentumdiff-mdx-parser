@@ -156,7 +156,7 @@ fn jsx_tag_name(line: &str) -> Option<&str> {
         return None;
     }
     let name = rest
-        .split(|c: char| c == ' ' || c == '/' || c == '>' || c == '\n')
+        .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
         .next()?;
     if name.is_empty() {
         None
@@ -183,50 +183,230 @@ fn jsx_component_label(line: &str) -> Option<String> {
     Some(tag.to_string())
 }
 
-fn jsx_attribute_nodes(line: &str, parent_id: &str, line_no: u32) -> Vec<SemanticNode> {
-    let trimmed = line.trim();
-    let Some(after_tag) = trimmed
-        .trim_start_matches('<')
-        .split_once(|c: char| c == ' ' || c == '\t')
-        .map(|(_, rest)| rest)
-    else {
+fn jsx_attribute_nodes(tag: &str, parent_id: &str, line_no: u32) -> Vec<SemanticNode> {
+    let Some(name) = jsx_tag_name(tag) else {
         return Vec::new();
     };
-    let attrs = after_tag
-        .trim()
-        .trim_end_matches('>')
-        .trim_end_matches('/')
-        .trim();
+    let mut cursor = 1 + name.len();
     let mut nodes = Vec::new();
-    for (idx, part) in attrs.split_whitespace().enumerate() {
-        let attr = part
-            .trim_end_matches('>')
-            .trim_end_matches('/')
-            .trim_end_matches(',')
-            .trim();
-        if attr.is_empty() || !attr.contains('=') {
+    while cursor < tag.len() {
+        while tag[cursor..].starts_with(char::is_whitespace) {
+            cursor += tag[cursor..].chars().next().unwrap().len_utf8();
+        }
+        if cursor == tag.len() || tag[cursor..].starts_with('>') || tag[cursor..].starts_with("/>")
+        {
+            break;
+        }
+        let start = cursor;
+        while cursor < tag.len() {
+            let ch = tag[cursor..].chars().next().unwrap();
+            if ch.is_whitespace() || matches!(ch, '=' | '>' | '/') {
+                break;
+            }
+            cursor += ch.len_utf8();
+        }
+        while tag[cursor..].starts_with(char::is_whitespace) {
+            cursor += tag[cursor..].chars().next().unwrap().len_utf8();
+        }
+        if !tag[cursor..].starts_with('=') {
+            if cursor == start {
+                cursor += tag[cursor..].chars().next().unwrap().len_utf8();
+            }
             continue;
         }
-        let label = attr
-            .trim_matches(|c| c == '"' || c == '\'' || c == '{' || c == '}')
-            .to_string();
+        cursor += 1;
+        while tag[cursor..].starts_with(char::is_whitespace) {
+            cursor += tag[cursor..].chars().next().unwrap().len_utf8();
+        }
+        let mut context = LexicalState::default();
+        while cursor < tag.len() {
+            let ch = tag[cursor..].chars().next().unwrap();
+            if context.neutral()
+                && (ch.is_whitespace() || ch == '>' || tag[cursor..].starts_with("/>"))
+            {
+                break;
+            }
+            context.push(ch);
+            cursor += ch.len_utf8();
+        }
+        let attr = &tag[start..cursor];
         let mut attribute = leaf(
-            &format!("{parent_id}.{}", idx),
+            &format!("{parent_id}.{}", nodes.len()),
             "jsx_attribute",
-            &label,
+            attr,
             line_no,
         );
-        attribute.position.start_col = (attr.as_ptr() as usize - line.as_ptr() as usize) as u32;
-        attribute.position.end_col = attribute.position.start_col + attr.len() as u32;
+        let point = |offset| {
+            let prefix = &tag[..offset];
+            (
+                line_no + prefix.bytes().filter(|&b| b == b'\n').count() as u32,
+                prefix.rsplit('\n').next().unwrap_or("").len() as u32,
+            )
+        };
+        (attribute.position.start_line, attribute.position.start_col) = point(start);
+        (attribute.position.end_line, attribute.position.end_col) = point(cursor);
         nodes.push(attribute);
     }
     nodes
 }
 
-/// True if a line looks like it starts a JSX component usage.
-fn is_jsx_usage(line: &str) -> bool {
-    let t = line.trim();
-    t.starts_with('<') && t.len() > 1 && t.chars().nth(1).map(|c| c.is_uppercase()).unwrap_or(false)
+// Opening tags may span lines. Keep quote/expression state so a quoted `>` or
+// an arrow in a JSX expression does not prematurely end the opening tag.
+#[derive(Default)]
+struct LexicalState {
+    quote: Option<char>,
+    escaped: bool,
+    braces: usize,
+}
+impl LexicalState {
+    fn neutral(&self) -> bool {
+        self.quote.is_none() && self.braces == 0
+    }
+    fn push(&mut self, ch: char) {
+        if let Some(quote) = self.quote {
+            if self.escaped {
+                self.escaped = false;
+            } else if ch == '\\' {
+                self.escaped = true;
+            } else if ch == quote {
+                self.quote = None;
+            }
+        } else {
+            match ch {
+                '\'' | '"' | '`' => self.quote = Some(ch),
+                '{' => self.braces += 1,
+                '}' => self.braces = self.braces.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+}
+#[derive(Default)]
+struct PendingTag {
+    text: String,
+    line: u32,
+    col: u32,
+    context: LexicalState,
+}
+impl PendingTag {
+    fn push(&mut self, ch: char) -> bool {
+        self.text.push(ch);
+        let end = self.context.neutral() && ch == '>';
+        self.context.push(ch);
+        end
+    }
+}
+
+fn prose(text: &str, line: u32, col: usize, children: &mut Vec<SemanticNode>, id: &mut usize) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut paragraph = leaf(&format!("0.{}", *id), "paragraph", trimmed, line);
+    *id += 1;
+    paragraph.position.start_col = (col + text.len() - text.trim_start().len()) as u32;
+    paragraph.position.end_col = (col + text.trim_end().len()) as u32;
+    children.push(paragraph);
+}
+
+fn jsx_line(
+    line: &str,
+    lineno: u32,
+    pending: &mut Option<PendingTag>,
+    expression: &mut LexicalState,
+    stack: &mut Vec<(String, usize)>,
+    children: &mut Vec<SemanticNode>,
+    id: &mut usize,
+) -> Result<(), &'static str> {
+    let mut cursor = 0;
+    let mut prose_start = 0;
+    let mut inline_ticks = 0;
+    while cursor < line.len() {
+        if pending.is_none() {
+            let ch = line[cursor..].chars().next().unwrap();
+            if !expression.neutral() || (inline_ticks == 0 && ch == '{') {
+                expression.push(ch);
+                cursor += ch.len_utf8();
+                continue;
+            }
+            if line.as_bytes()[cursor] == b'`' {
+                let count = line[cursor..].bytes().take_while(|&b| b == b'`').count();
+                if inline_ticks == 0 {
+                    inline_ticks = count;
+                } else if inline_ticks == count {
+                    inline_ticks = 0;
+                }
+                cursor += count;
+                continue;
+            }
+            let rest = &line[cursor..];
+            let tag = rest.strip_prefix("</").or_else(|| rest.strip_prefix('<'));
+            let is_tag = inline_ticks == 0
+                && (cursor == 0 || line.as_bytes()[cursor - 1] != b'\\')
+                && tag
+                    .and_then(|s| s.chars().next())
+                    .is_some_and(char::is_uppercase);
+            if !is_tag {
+                cursor += rest.chars().next().unwrap().len_utf8();
+                continue;
+            }
+            prose(
+                &line[prose_start..cursor],
+                lineno,
+                prose_start,
+                children,
+                id,
+            );
+            *pending = Some(PendingTag {
+                line: lineno,
+                col: cursor as u32,
+                ..Default::default()
+            });
+        }
+        let ch = line[cursor..].chars().next().unwrap();
+        cursor += ch.len_utf8();
+        if pending.as_mut().unwrap().push(ch) {
+            let tag = pending.take().unwrap();
+            if let Some(close) = tag.text.strip_prefix("</") {
+                let name = close.trim_end_matches('>').trim();
+                let (open, index) = stack.pop().ok_or("Unmatched JSX closing tag")?;
+                if open != name {
+                    return Err("Mismatched JSX closing tag");
+                }
+                children[index].position.end_line = lineno;
+                children[index].position.end_col = cursor as u32;
+            } else {
+                let name = jsx_tag_name(&tag.text).ok_or("Invalid JSX component tag")?;
+                let label = jsx_component_label(&tag.text).ok_or("Invalid JSX component label")?;
+                let node_id = format!("0.{}", *id);
+                *id += 1;
+                let mut attrs = jsx_attribute_nodes(&tag.text, &node_id, tag.line);
+                for attr in &mut attrs {
+                    if attr.position.start_line == tag.line {
+                        attr.position.start_col += tag.col;
+                    }
+                    if attr.position.end_line == tag.line {
+                        attr.position.end_col += tag.col;
+                    }
+                }
+                let mut component = node(&node_id, "jsx_component", &label, tag.line, attrs);
+                component.position.start_col = tag.col;
+                component.position.end_line = lineno;
+                component.position.end_col = cursor as u32;
+                if !tag.text.trim_end_matches('>').trim_end().ends_with('/') {
+                    stack.push((name.to_string(), children.len()));
+                }
+                children.push(component);
+            }
+            prose_start = cursor;
+        }
+    }
+    if let Some(tag) = pending {
+        tag.push('\n');
+    } else {
+        prose(&line[prose_start..], lineno, prose_start, children, id);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +416,9 @@ fn is_jsx_usage(line: &str) -> bool {
 fn parse_mdx(source: &str) -> String {
     let mut children: Vec<SemanticNode> = Vec::new();
     let mut id_counter: usize = 0;
-    let mut in_code_block = false;
+    let mut code_fence: Option<(char, usize)> = None;
+    let mut pending_tag: Option<PendingTag> = None;
+    let mut expression = LexicalState::default();
     let mut code_lang = String::new();
     let mut code_start_line: u32 = 0;
     let mut jsx_stack: Vec<(String, usize)> = Vec::new();
@@ -246,6 +428,21 @@ fn parse_mdx(source: &str) -> String {
     for (line_idx, line) in source.lines().enumerate() {
         let lineno = line_idx as u32;
         let trimmed = line.trim();
+
+        if pending_tag.is_some() || !expression.neutral() {
+            if let Err(error) = jsx_line(
+                line,
+                lineno,
+                &mut pending_tag,
+                &mut expression,
+                &mut jsx_stack,
+                &mut children,
+                &mut id_counter,
+            ) {
+                return serde_json::json!({"error": error}).to_string();
+            }
+            continue;
+        }
 
         // --- YAML frontmatter (--- ... ---) ---
         if !frontmatter_done && lineno == 0 && trimmed == "---" {
@@ -260,48 +457,35 @@ fn parse_mdx(source: &str) -> String {
             continue;
         }
 
-        // --- Fenced code blocks (``` ... ```) ---
-        if trimmed.starts_with("```") {
-            if !in_code_block {
-                in_code_block = true;
-                code_lang = trimmed[3..].trim().to_string();
-                code_start_line = lineno;
-            } else {
-                // Closing fence
+        // A shorter fence or a different delimiter remains code content.
+        let fence_char = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'));
+        let fence_len = fence_char.map_or(0, |c| trimmed.chars().take_while(|&x| x == c).count());
+        if let Some((delimiter, length)) = code_fence {
+            if fence_char == Some(delimiter)
+                && fence_len >= length
+                && trimmed[fence_len..].trim().is_empty()
+            {
                 let label = if code_lang.is_empty() {
-                    "text".to_string()
+                    "text"
                 } else {
-                    code_lang.clone()
+                    &code_lang
                 };
                 let id = format!("0.{}", id_counter);
                 id_counter += 1;
-                let mut block = leaf(&id, "code_block", &label, code_start_line);
+                let mut block = leaf(&id, "code_block", label, code_start_line);
                 block.position.end_line = lineno;
                 block.position.end_col = line.trim_end().len() as u32;
                 children.push(block);
-                in_code_block = false;
+                code_fence = None;
                 code_lang.clear();
             }
             continue;
         }
-        if in_code_block {
+        if fence_len >= 3 {
+            code_fence = Some((fence_char.unwrap(), fence_len));
+            code_lang = trimmed[fence_len..].trim().to_string();
+            code_start_line = lineno;
             continue;
-        }
-
-        // Closing component tags complete the opening node's source extent.
-        if let Some(rest) = trimmed.strip_prefix("</") {
-            let tag = rest.trim_end_matches('>').trim();
-            if tag.chars().next().is_some_and(char::is_uppercase) {
-                let Some((open, index)) = jsx_stack.pop() else {
-                    return serde_json::json!({"error": "Unmatched JSX closing tag"}).to_string();
-                };
-                if open != tag {
-                    return serde_json::json!({"error": "Mismatched JSX closing tag"}).to_string();
-                }
-                children[index].position.end_line = lineno;
-                children[index].position.end_col = line.trim_end().len() as u32;
-                continue;
-            }
         }
 
         // --- Import statements ---
@@ -334,38 +518,29 @@ fn parse_mdx(source: &str) -> String {
             }
         }
 
-        // --- Top-level JSX component usage ---
-        if is_jsx_usage(trimmed) {
-            if let Some(tag) = jsx_component_label(trimmed) {
-                let id = format!("0.{}", id_counter);
-                id_counter += 1;
-                let attrs = jsx_attribute_nodes(line, &id, lineno);
-                let tag_name = jsx_tag_name(trimmed).unwrap_or("");
-                if !trimmed.ends_with("/>") && !trimmed.contains(&format!("</{tag_name}>")) {
-                    jsx_stack.push((tag_name.to_string(), children.len()));
-                }
-                children.push(node(&id, "jsx_component", &tag, lineno, attrs));
-            }
-            continue;
-        }
-
-        // --- Prose paragraphs (#46) --- previously captured NOWHERE, so an edit inside
-        // body text ("Node.js 18+" -> "19+") hashed style-only.
-        if !trimmed.is_empty() {
-            let id = format!("0.{}", id_counter);
-            id_counter += 1;
-            children.push(leaf(&id, "paragraph", trimmed, lineno));
+        if let Err(error) = jsx_line(
+            line,
+            lineno,
+            &mut pending_tag,
+            &mut expression,
+            &mut jsx_stack,
+            &mut children,
+            &mut id_counter,
+        ) {
+            return serde_json::json!({"error": error}).to_string();
         }
     }
 
-    if in_code_block || !jsx_stack.is_empty() {
+    if code_fence.is_some() || pending_tag.is_some() || !jsx_stack.is_empty() {
         return serde_json::json!({"error": "Unterminated MDX code block or component"})
             .to_string();
     }
     let lines: Vec<_> = source.lines().collect();
     for child in &mut children {
         if let Some(line) = lines.get(child.position.start_line as usize) {
-            child.position.start_col = (line.len() - line.trim_start().len()) as u32;
+            if child.node_type != "jsx_component" && child.node_type != "paragraph" {
+                child.position.start_col = (line.len() - line.trim_start().len()) as u32;
+            }
             if child.position.end_col == 0 && child.position.end_line == child.position.start_line {
                 child.position.end_col = line.trim_end().len() as u32;
             }
@@ -430,6 +605,118 @@ mod tests {
     use super::*;
     use crate::exports::intentdiff::plugin::parser::Guest;
     use intentumdiff_plugin_sdk::testing as t;
+
+    #[test]
+    fn multiline_attribute_end_column_does_not_inherit_inline_start_offset() {
+        let tree: serde_json::Value =
+            serde_json::from_str(&parse_mdx("é <Card title=\"a\nb\"/> ")).unwrap();
+        let card = tree["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["node_type"] == "jsx_component")
+            .unwrap();
+        assert_eq!(card["children"][0]["position"]["start_col"], 9);
+        assert_eq!(card["children"][0]["position"]["end_line"], 1);
+        assert_eq!(card["children"][0]["position"]["end_col"], 2);
+    }
+
+    #[test]
+    fn attribute_words_and_expression_tails_remain_semantic() {
+        for source in [
+            "<Card\n title=\"Hello world\"\n/>",
+            "<Card title = {hello + world} />",
+        ] {
+            let before: serde_json::Value = serde_json::from_str(&parse_mdx(source)).unwrap();
+            let after: serde_json::Value =
+                serde_json::from_str(&parse_mdx(&source.replace("world", "there"))).unwrap();
+            assert!(before.get("error").is_none(), "{before}");
+            assert!(after.get("error").is_none(), "{after}");
+            assert_ne!(before["structural_hash"], after["structural_hash"]);
+        }
+    }
+
+    #[test]
+    fn mdx_expressions_do_not_turn_strings_or_comparisons_into_tags() {
+        for source in [
+            r#"{"Use <Card> here"}"#,
+            r#"{score <MAX ? "low" : "high"}"#,
+            "{\n 'Use <Card> here'\n}\n<Real />",
+        ] {
+            let tree: serde_json::Value = serde_json::from_str(&parse_mdx(source)).unwrap();
+            assert!(tree.get("error").is_none(), "{tree}");
+            assert!(!tree["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["label"] == "Card"));
+        }
+    }
+
+    #[test]
+    fn jsx_delimiters_inside_quotes_and_code_do_not_close_components() {
+        let source =
+            "é <Outer><Card\n title=\">\" check={x => x > 1}\n/></Outer> after\n`<NotAComponent>`";
+        let tree: serde_json::Value = serde_json::from_str(&parse_mdx(source)).unwrap();
+        assert!(tree.get("error").is_none(), "{tree}");
+        let nodes = tree["children"].as_array().unwrap();
+        let components: Vec<_> = nodes
+            .iter()
+            .filter(|n| n["node_type"] == "jsx_component")
+            .collect();
+        assert_eq!(components.len(), 2);
+        assert_eq!(components[0]["position"]["start_col"], 3);
+        assert_eq!(components[0]["position"]["end_line"], 2);
+        assert_eq!(components[0]["position"]["end_col"], 10);
+        assert_eq!(components[1]["position"]["end_col"], 2);
+        assert!(nodes.iter().any(|n| n["label"] == "after"));
+    }
+
+    #[test]
+    fn multiline_self_closing_component_keeps_props_and_extent() {
+        let source = "<Card\n  title=\"Hello\"\n/>";
+        let tree: serde_json::Value = serde_json::from_str(&parse_mdx(source)).unwrap();
+        assert!(tree.get("error").is_none(), "{tree}");
+        let card = &tree["children"][0];
+        assert_eq!(card["node_type"], "jsx_component");
+        assert_eq!(card["position"]["end_line"], 2);
+        assert_eq!(card["position"]["end_col"], 2);
+        assert_eq!(card["children"][0]["position"]["start_line"], 1);
+        let changed: serde_json::Value =
+            serde_json::from_str(&parse_mdx(&source.replace("Hello", "World"))).unwrap();
+        assert_ne!(tree["structural_hash"], changed["structural_hash"]);
+    }
+
+    #[test]
+    fn component_after_prose_keeps_prose_and_component_span() {
+        let source = "Intro <Callout>\ntext\n</Callout>";
+        let tree: serde_json::Value = serde_json::from_str(&parse_mdx(source)).unwrap();
+        assert!(tree.get("error").is_none(), "{tree}");
+        let nodes = tree["children"].as_array().unwrap();
+        assert!(nodes.iter().any(|n| n["label"] == "Intro"));
+        let component = nodes
+            .iter()
+            .find(|n| n["node_type"] == "jsx_component")
+            .unwrap();
+        assert_eq!(component["position"]["start_col"], 6);
+        assert_eq!(component["position"]["end_line"], 2);
+        assert_eq!(component["position"]["end_col"], 10);
+        assert!(nodes.iter().any(|n| n["label"] == "text"));
+    }
+
+    #[test]
+    fn code_fence_requires_matching_character_and_sufficient_length() {
+        for source in ["````md\n```\n~~~\n````", "~~~~md\n~~~\n```\n~~~~"] {
+            let tree: serde_json::Value = serde_json::from_str(&parse_mdx(source)).unwrap();
+            assert!(tree.get("error").is_none(), "{tree}");
+            let nodes = tree["children"].as_array().unwrap();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0]["node_type"], "code_block");
+            assert_eq!(nodes[0]["label"], "md");
+            assert_eq!(nodes[0]["position"]["end_line"], 3);
+            assert_eq!(nodes[0]["position"]["end_col"], 4);
+        }
+    }
 
     #[test]
     fn incomplete_component_and_fence_return_explicit_errors() {
