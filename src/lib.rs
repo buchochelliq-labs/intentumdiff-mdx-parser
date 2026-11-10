@@ -16,6 +16,18 @@
 //!   jsx_component        — Top-level JSX element usage `<ComponentName …>`
 //!                          (label = tag name)
 //!
+//! Semantic payload children (so core sees edits as label changes):
+//!
+//!   heading_level  — child of `section`; ATX level `1`–`6`. The optional
+//!                    CommonMark closing `#` sequence is not heading text.
+//!   export_value   — child of `component_definition`; canonical initializer
+//!                    or declaration tail (layout collapsed, simple strings
+//!                    normalised to double quotes, literals kept verbatim).
+//!   import_binding — child of `import_statement`; `Name`, `A as B`,
+//!                    `default as X` or `* as NS`.
+//!   jsx_attribute  — child of `jsx_component`; `name=value`, boolean
+//!                    shorthand `name`, or spread `{...props}`.
+//!
 //! Detection: `.mdx` file extension only.
 
 use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
@@ -198,38 +210,60 @@ fn jsx_attribute_nodes(tag: &str, parent_id: &str, line_no: u32) -> Vec<Semantic
             break;
         }
         let start = cursor;
-        while cursor < tag.len() {
-            let ch = tag[cursor..].chars().next().unwrap();
-            if ch.is_whitespace() || matches!(ch, '=' | '>' | '/') {
-                break;
+        let attr_end;
+        if tag[cursor..].starts_with('{') {
+            // Spread attribute `{...props}`: keep the whole balanced expression.
+            let mut context = LexicalState::default();
+            while cursor < tag.len() {
+                let ch = tag[cursor..].chars().next().unwrap();
+                context.push(ch);
+                cursor += ch.len_utf8();
+                if context.neutral() {
+                    break;
+                }
             }
-            cursor += ch.len_utf8();
-        }
-        while tag[cursor..].starts_with(char::is_whitespace) {
-            cursor += tag[cursor..].chars().next().unwrap().len_utf8();
-        }
-        if !tag[cursor..].starts_with('=') {
+            attr_end = cursor;
+        } else {
+            while cursor < tag.len() {
+                let ch = tag[cursor..].chars().next().unwrap();
+                if ch.is_whitespace() || matches!(ch, '=' | '>' | '/' | '{') {
+                    break;
+                }
+                cursor += ch.len_utf8();
+            }
             if cursor == start {
+                // Stray delimiter such as `/` before a non-`>` byte.
+                cursor += tag[cursor..].chars().next().unwrap().len_utf8();
+                continue;
+            }
+            let name_end = cursor;
+            while tag[cursor..].starts_with(char::is_whitespace) {
                 cursor += tag[cursor..].chars().next().unwrap().len_utf8();
             }
-            continue;
-        }
-        cursor += 1;
-        while tag[cursor..].starts_with(char::is_whitespace) {
-            cursor += tag[cursor..].chars().next().unwrap().len_utf8();
-        }
-        let mut context = LexicalState::default();
-        while cursor < tag.len() {
-            let ch = tag[cursor..].chars().next().unwrap();
-            if context.neutral()
-                && (ch.is_whitespace() || ch == '>' || tag[cursor..].starts_with("/>"))
-            {
-                break;
+            if tag[cursor..].starts_with('=') {
+                cursor += 1;
+                while tag[cursor..].starts_with(char::is_whitespace) {
+                    cursor += tag[cursor..].chars().next().unwrap().len_utf8();
+                }
+                let mut context = LexicalState::default();
+                while cursor < tag.len() {
+                    let ch = tag[cursor..].chars().next().unwrap();
+                    if context.neutral()
+                        && (ch.is_whitespace() || ch == '>' || tag[cursor..].starts_with("/>"))
+                    {
+                        break;
+                    }
+                    context.push(ch);
+                    cursor += ch.len_utf8();
+                }
+                attr_end = cursor;
+            } else {
+                // Boolean shorthand (`<Button disabled />` passes `disabled={true}`).
+                attr_end = name_end;
+                cursor = name_end;
             }
-            context.push(ch);
-            cursor += ch.len_utf8();
         }
-        let attr = &tag[start..cursor];
+        let attr = &tag[start..attr_end];
         let mut attribute = leaf(
             &format!("{parent_id}.{}", nodes.len()),
             "jsx_attribute",
@@ -244,7 +278,7 @@ fn jsx_attribute_nodes(tag: &str, parent_id: &str, line_no: u32) -> Vec<Semantic
             )
         };
         (attribute.position.start_line, attribute.position.start_col) = point(start);
-        (attribute.position.end_line, attribute.position.end_col) = point(cursor);
+        (attribute.position.end_line, attribute.position.end_col) = point(attr_end);
         nodes.push(attribute);
     }
     nodes
@@ -409,6 +443,216 @@ fn jsx_line(
     Ok(())
 }
 
+/// Byte span of `part` inside `line`, which must be a subslice of it.
+fn subslice_span(line: &str, part: &str) -> (u32, u32) {
+    let start = part.as_ptr() as usize - line.as_ptr() as usize;
+    (start as u32, (start + part.len()) as u32)
+}
+
+fn spanned_leaf(
+    id: &str,
+    node_type: &str,
+    label: &str,
+    line_no: u32,
+    span: (u32, u32),
+) -> SemanticNode {
+    let mut n = leaf(id, node_type, label, line_no);
+    n.position.start_col = span.0;
+    n.position.end_col = span.1;
+    n
+}
+
+/// Parse an ATX heading line (already stripped of indentation).
+/// Returns `(level, content)` where `content` excludes the optional closing
+/// hash sequence. Per CommonMark, a closing sequence is a run of `#` that is
+/// either the whole content or preceded by a space/tab; anything else (`foo#`,
+/// `foo \#`) is heading text.
+fn atx_heading(trimmed: &str) -> Option<(usize, &str)> {
+    let level = trimmed.bytes().take_while(|&b| b == b'#').count();
+    if level == 0 || level > 6 {
+        return None;
+    }
+    let rest = &trimmed[level..];
+    if !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
+        return None;
+    }
+    let content = rest.trim_matches([' ', '\t']);
+    let without_hashes = content.trim_end_matches('#');
+    let content = if without_hashes.len() == content.len() {
+        content
+    } else if without_hashes.is_empty() {
+        without_hashes
+    } else if without_hashes.ends_with([' ', '\t']) {
+        without_hashes.trim_end_matches([' ', '\t'])
+    } else {
+        content
+    };
+    Some((level, content))
+}
+
+/// Canonical text of a small JavaScript expression: layout outside literals is
+/// collapsed, and simple `'...'`/`"..."` string literals are re-emitted with
+/// double quotes so equivalent quote spellings compare equal. Literal contents,
+/// operators and other tokens are retained verbatim.
+fn canonical_js(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.trim().chars().peekable();
+    let mut pending_space = false;
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !out.is_empty() {
+            out.push(' ');
+        }
+        pending_space = false;
+        match ch {
+            '\'' | '"' => {
+                let mut value = String::new();
+                let mut closed = false;
+                let mut raw = String::from(ch);
+                while let Some(c) = chars.next() {
+                    raw.push(c);
+                    if c == ch {
+                        closed = true;
+                        break;
+                    }
+                    if c == '\\' {
+                        match chars.next() {
+                            Some(e) => {
+                                raw.push(e);
+                                match e {
+                                    '\\' | '\'' | '"' => value.push(e),
+                                    'n' => value.push('\n'),
+                                    't' => value.push('\t'),
+                                    'r' => value.push('\r'),
+                                    _ => {
+                                        // Keep other escapes in source form.
+                                        value.push('\\');
+                                        value.push(e);
+                                    }
+                                }
+                            }
+                            None => break,
+                        }
+                    } else {
+                        value.push(c);
+                    }
+                }
+                if closed {
+                    out.push('"');
+                    for c in value.chars() {
+                        match c {
+                            '"' => out.push_str("\\\""),
+                            '\n' => out.push_str("\\n"),
+                            '\t' => out.push_str("\\t"),
+                            '\r' => out.push_str("\\r"),
+                            _ => out.push(c),
+                        }
+                    }
+                    out.push('"');
+                } else {
+                    out.push_str(&raw);
+                }
+            }
+            '`' => {
+                out.push(ch);
+                let mut escaped = false;
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '`' {
+                        break;
+                    }
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// The exported payload after the component name: the initializer of a
+/// `const`/`let`/`var` export, or the remaining declaration text otherwise.
+fn export_payload<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let rest = line.trim_end();
+    let after_name = if name == "(anonymous)" {
+        let r = rest.trim_start().strip_prefix("export")?.trim_start();
+        let r = r.strip_prefix("default").unwrap_or(r).trim_start();
+        r.strip_prefix("function")
+            .or_else(|| r.strip_prefix("class"))
+            .unwrap_or(r)
+    } else {
+        let pos = rest.find(name)?;
+        &rest[pos + name.len()..]
+    };
+    let mut state = LexicalState::default();
+    for (i, ch) in after_name.char_indices() {
+        if state.neutral() && ch == '=' && !after_name[i + 1..].starts_with(['=', '>']) {
+            let value = after_name[i + 1..].trim().trim_end_matches(';').trim_end();
+            return (!value.is_empty()).then_some(value);
+        }
+        state.push(ch);
+    }
+    let value = after_name.trim().trim_end_matches(';').trim_end();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Bindings introduced by an import line: `Safe`, `Danger as Safe`,
+/// `default as X`, `* as NS`. The source string is the module label.
+fn import_bindings<'a>(line: &'a str) -> Vec<(String, &'a str)> {
+    let trimmed = line.trim();
+    let Some(from_pos) = trimmed.rfind(" from ") else {
+        return Vec::new();
+    };
+    let clause = trimmed["import".len()..from_pos].trim();
+    let clause = clause
+        .strip_prefix("type ")
+        .map(str::trim_start)
+        .unwrap_or(clause);
+    let mut bindings = Vec::new();
+    let mut push = |raw: &'a str, default: bool| {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return;
+        }
+        let label = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let label = if default {
+            format!("default as {label}")
+        } else {
+            label
+        };
+        bindings.push((label, raw));
+    };
+    let (outside, named): ([&'a str; 2], Option<&'a str>) =
+        match (clause.find('{'), clause.rfind('}')) {
+            (Some(open), Some(close)) if open < close => (
+                [&clause[..open], &clause[close + 1..]],
+                Some(&clause[open + 1..close]),
+            ),
+            _ => ([clause, ""], None),
+        };
+    // Default and namespace bindings sit outside the braces.
+    for segment in outside {
+        for part in segment.split(',') {
+            let part = part.trim();
+            if !part.is_empty() {
+                push(part, !part.starts_with('*'));
+            }
+        }
+    }
+    if let Some(named) = named {
+        for part in named.split(',') {
+            push(part, false);
+        }
+    }
+    bindings
+}
+
 // ---------------------------------------------------------------------------
 // Main parse
 // ---------------------------------------------------------------------------
@@ -493,7 +737,20 @@ fn parse_mdx(source: &str) -> String {
             let module = import_module(trimmed).to_string();
             let id = format!("0.{}", id_counter);
             id_counter += 1;
-            children.push(leaf(&id, "import_statement", &module, lineno));
+            let bindings = import_bindings(trimmed)
+                .into_iter()
+                .enumerate()
+                .map(|(i, (label, raw))| {
+                    spanned_leaf(
+                        &format!("{id}.{i}"),
+                        "import_binding",
+                        &label,
+                        lineno,
+                        subslice_span(line, raw),
+                    )
+                })
+                .collect();
+            children.push(node(&id, "import_statement", &module, lineno, bindings));
             continue;
         }
 
@@ -502,20 +759,35 @@ fn parse_mdx(source: &str) -> String {
             let name = export_component_name(trimmed).to_string();
             let id = format!("0.{}", id_counter);
             id_counter += 1;
-            children.push(leaf(&id, "component_definition", &name, lineno));
+            let value = export_payload(trimmed, &name)
+                .map(|raw| {
+                    vec![spanned_leaf(
+                        &format!("{id}.0"),
+                        "export_value",
+                        &canonical_js(raw),
+                        lineno,
+                        subslice_span(line, raw),
+                    )]
+                })
+                .unwrap_or_default();
+            children.push(node(&id, "component_definition", &name, lineno, value));
             continue;
         }
 
         // --- Markdown headings ---
-        if trimmed.starts_with('#') {
-            let level = trimmed.chars().take_while(|&c| c == '#').count();
-            if level <= 6 && trimmed[level..].starts_with(|c: char| c == ' ' || c == '\t') {
-                let heading_text = trimmed[level..].trim().to_string();
-                let id = format!("0.{}", id_counter);
-                id_counter += 1;
-                children.push(leaf(&id, "section", &heading_text, lineno));
-                continue;
-            }
+        if let Some((level, heading_text)) = atx_heading(trimmed) {
+            let id = format!("0.{}", id_counter);
+            id_counter += 1;
+            let marker = &trimmed[..level];
+            let level_node = spanned_leaf(
+                &format!("{id}.0"),
+                "heading_level",
+                &level.to_string(),
+                lineno,
+                subslice_span(line, marker),
+            );
+            children.push(node(&id, "section", heading_text, lineno, vec![level_node]));
+            continue;
         }
 
         if let Err(error) = jsx_line(
@@ -834,5 +1106,194 @@ mod tests {
             old_json["children"][0]["structural_hash"],
             new_json["children"][0]["structural_hash"]
         );
+    }
+}
+
+#[cfg(test)]
+mod semantic_payload_tests {
+    use super::*;
+
+    fn tree(source: &str) -> serde_json::Value {
+        let tree: serde_json::Value = serde_json::from_str(&parse_mdx(source)).unwrap();
+        assert!(tree.get("error").is_none(), "{tree}");
+        tree
+    }
+
+    fn child_labels(node: &serde_json::Value) -> Vec<(String, String)> {
+        node["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["node_type"].as_str().unwrap().to_string(),
+                    c["label"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn span(node: &serde_json::Value) -> [u64; 4] {
+        let p = &node["position"];
+        [
+            p["start_line"].as_u64().unwrap(),
+            p["start_col"].as_u64().unwrap(),
+            p["end_line"].as_u64().unwrap(),
+            p["end_col"].as_u64().unwrap(),
+        ]
+    }
+
+    fn pair(old: &str, new: &str) -> (serde_json::Value, serde_json::Value) {
+        (tree(old), tree(new))
+    }
+
+    #[test]
+    fn export_value_is_a_semantic_child() {
+        let (old, new) = pair(
+            "export const count = 1\n\nCount: {count}\n",
+            "export const count = 2\n\nCount: {count}\n",
+        );
+        let (a, b) = (&old["children"][0], &new["children"][0]);
+        assert_eq!(a["label"], "count");
+        assert_eq!(child_labels(a), [("export_value".into(), "1".into())]);
+        assert_eq!(child_labels(b), [("export_value".into(), "2".into())]);
+        assert_eq!(span(&a["children"][0]), [0, 21, 0, 22]);
+        assert_ne!(old["structural_hash"], new["structural_hash"]);
+    }
+
+    #[test]
+    fn export_value_quote_spelling_is_preserved_equivalence() {
+        let (old, new) = pair(
+            "export const title = 'Ready'\n\n# {title}\n",
+            "export const title = \"Ready\"\n\n# {title}\n",
+        );
+        assert_eq!(old["children"][0]["children"][0]["label"], "\"Ready\"");
+        assert_eq!(old["structural_hash"], new["structural_hash"]);
+        // Literal content, operators and escaped quotes remain significant.
+        for (a, b) in [
+            ("export const t = 'a b'", "export const t = 'a  b'"),
+            ("export const t = 1 + 2", "export const t = 1 - 2"),
+            ("export const t = 'it\\'s'", "export const t = \"its\""),
+        ] {
+            assert_ne!(
+                tree(a)["structural_hash"],
+                tree(b)["structural_hash"],
+                "{a} / {b}"
+            );
+        }
+        assert_eq!(
+            tree("export const t = 'it\\'s';")["children"][0]["children"][0]["label"],
+            "\"it's\""
+        );
+        assert_eq!(
+            tree("export const t  =  1 +  2")["structural_hash"],
+            tree("export const t = 1 + 2")["structural_hash"]
+        );
+    }
+
+    #[test]
+    fn export_function_and_arrow_keep_declaration_payload() {
+        let t = tree("export const Foo = () => <b>x</b>\n");
+        assert_eq!(t["children"][0]["children"][0]["label"], "() => <b>x</b>");
+        let t = tree("export function Foo(a, b) {}\n");
+        assert_eq!(t["children"][0]["children"][0]["label"], "(a, b) {}");
+    }
+
+    #[test]
+    fn import_binding_alias_is_a_semantic_change() {
+        let (old, new) = pair(
+            "import { Safe } from \"./widgets\"\n\n<Safe />\n",
+            "import { Danger as Safe } from \"./widgets\"\n\n<Safe />\n",
+        );
+        let (a, b) = (&old["children"][0], &new["children"][0]);
+        assert_eq!(a["label"], "./widgets");
+        assert_eq!(child_labels(a), [("import_binding".into(), "Safe".into())]);
+        assert_eq!(
+            child_labels(b),
+            [("import_binding".into(), "Danger as Safe".into())]
+        );
+        assert_eq!(span(&a["children"][0]), [0, 9, 0, 13]);
+        assert_eq!(span(&b["children"][0]), [0, 9, 0, 23]);
+        assert_ne!(old["structural_hash"], new["structural_hash"]);
+    }
+
+    #[test]
+    fn import_default_namespace_and_named_bindings() {
+        let t = tree("import Foo, { A,  B as  C } from './x'\nimport * as NS from './y'\n");
+        assert_eq!(
+            child_labels(&t["children"][0]),
+            [
+                ("import_binding".into(), "default as Foo".into()),
+                ("import_binding".into(), "A".into()),
+                ("import_binding".into(), "B as C".into()),
+            ]
+        );
+        assert_eq!(
+            child_labels(&t["children"][1]),
+            [("import_binding".into(), "* as NS".into())]
+        );
+        assert!(child_labels(&tree("import './side-effect'")["children"][0]).is_empty());
+    }
+
+    #[test]
+    fn boolean_shorthand_and_spread_props_are_attributes() {
+        let (old, new) = pair("<Button disabled />\n", "<Button />\n");
+        let a = &old["children"][0];
+        assert_eq!(
+            child_labels(a),
+            [("jsx_attribute".into(), "disabled".into())]
+        );
+        assert_eq!(span(&a["children"][0]), [0, 8, 0, 16]);
+        assert!(child_labels(&new["children"][0]).is_empty());
+        assert_ne!(old["structural_hash"], new["structural_hash"]);
+
+        let t = tree("<Card\n  open\n  title=\"a b\"\n  {...rest}\n  wide/>");
+        assert_eq!(
+            child_labels(&t["children"][0]),
+            [
+                ("jsx_attribute".into(), "open".into()),
+                ("jsx_attribute".into(), "title=\"a b\"".into()),
+                ("jsx_attribute".into(), "{...rest}".into()),
+                ("jsx_attribute".into(), "wide".into()),
+            ]
+        );
+        assert_eq!(span(&t["children"][0]["children"][0]), [1, 2, 1, 6]);
+        assert_eq!(span(&t["children"][0]["children"][3]), [4, 2, 4, 6]);
+    }
+
+    #[test]
+    fn heading_level_is_a_semantic_child() {
+        let (old, new) = pair("# Page\n", "## Page\n");
+        let (a, b) = (&old["children"][0], &new["children"][0]);
+        assert_eq!(a["label"], "Page");
+        assert_eq!(b["label"], "Page");
+        assert_eq!(child_labels(a), [("heading_level".into(), "1".into())]);
+        assert_eq!(child_labels(b), [("heading_level".into(), "2".into())]);
+        assert_eq!(span(&b["children"][0]), [0, 0, 0, 2]);
+        assert_ne!(old["structural_hash"], new["structural_hash"]);
+    }
+
+    #[test]
+    fn optional_closing_hash_sequence_is_not_heading_text() {
+        let (old, new) = pair("# hi!", "# hi! #");
+        assert_eq!(new["children"][0]["label"], "hi!");
+        assert_eq!(old["structural_hash"], new["structural_hash"]);
+        for (source, label) in [
+            ("## foo ##", "foo"),
+            ("# foo ####   ", "foo"),
+            ("# foo\t#", "foo"),
+            ("# foo#", "foo#"),
+            ("# foo \\#", "foo \\#"),
+            ("# foo #\\##", "foo #\\##"),
+            ("### ###", ""),
+            ("# #", ""),
+            ("#", ""),
+            ("# hi! # there", "hi! # there"),
+        ] {
+            assert_eq!(tree(source)["children"][0]["label"], label, "{source}");
+        }
+        // Seven hashes or a missing space are not ATX headings.
+        assert_ne!(tree("####### x")["children"][0]["node_type"], "section");
+        assert_ne!(tree("#hashtag")["children"][0]["node_type"], "section");
     }
 }
