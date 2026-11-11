@@ -490,8 +490,8 @@ fn atx_heading(trimmed: &str) -> Option<(usize, &str)> {
     Some((level, content))
 }
 
-/// Canonical text of a small JavaScript expression: layout outside literals is
-/// collapsed, and simple `'...'`/`"..."` string literals are re-emitted with
+/// Canonical text of a small JavaScript expression: layout outside literals
+/// (strings, templates and regular expressions) is collapsed, and simple `'...'`/`"..."` string literals are re-emitted with
 /// double quotes so equivalent quote spellings compare equal. Literal contents,
 /// operators and other tokens are retained verbatim.
 fn canonical_js(text: &str) -> String {
@@ -509,7 +509,11 @@ fn canonical_js(text: &str) -> String {
         pending_space = false;
         match ch {
             '\'' | '"' => {
-                let mut value = String::new();
+                // Re-encode the literal as a double-quoted string while
+                // decoding it, so quote spelling is normalized but every
+                // distinct runtime value (and every unsupported escape, kept
+                // in source form) stays distinct.
+                let mut encoded = String::from('"');
                 let mut closed = false;
                 let mut raw = String::from(ch);
                 while let Some(c) = chars.next() {
@@ -523,37 +527,62 @@ fn canonical_js(text: &str) -> String {
                             Some(e) => {
                                 raw.push(e);
                                 match e {
-                                    '\\' | '\'' | '"' => value.push(e),
-                                    'n' => value.push('\n'),
-                                    't' => value.push('\t'),
-                                    'r' => value.push('\r'),
+                                    '\\' => encoded.push_str("\\\\"),
+                                    '"' => encoded.push_str("\\\""),
+                                    '\'' => encoded.push('\''),
+                                    'n' => encoded.push_str("\\n"),
+                                    't' => encoded.push_str("\\t"),
+                                    'r' => encoded.push_str("\\r"),
                                     _ => {
                                         // Keep other escapes in source form.
-                                        value.push('\\');
-                                        value.push(e);
+                                        encoded.push('\\');
+                                        encoded.push(e);
                                     }
                                 }
                             }
                             None => break,
                         }
                     } else {
-                        value.push(c);
+                        match c {
+                            '"' => encoded.push_str("\\\""),
+                            '\n' => encoded.push_str("\\n"),
+                            '\t' => encoded.push_str("\\t"),
+                            '\r' => encoded.push_str("\\r"),
+                            _ => encoded.push(c),
+                        }
                     }
                 }
                 if closed {
-                    out.push('"');
-                    for c in value.chars() {
-                        match c {
-                            '"' => out.push_str("\\\""),
-                            '\n' => out.push_str("\\n"),
-                            '\t' => out.push_str("\\t"),
-                            '\r' => out.push_str("\\r"),
-                            _ => out.push(c),
-                        }
-                    }
-                    out.push('"');
+                    encoded.push('"');
+                    out.push_str(&encoded);
                 } else {
                     out.push_str(&raw);
+                }
+            }
+            '/' if regex_may_start(&out) => {
+                // A regular-expression literal: its body (including
+                // whitespace) is copied verbatim up to the closing `/`
+                // outside a character class.
+                out.push(ch);
+                let mut escaped = false;
+                let mut in_class = false;
+                while let Some(&c) = chars.peek() {
+                    if c == '\n' {
+                        break;
+                    }
+                    chars.next();
+                    out.push(c);
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '[' {
+                        in_class = true;
+                    } else if c == ']' {
+                        in_class = false;
+                    } else if c == '/' && !in_class {
+                        break;
+                    }
                 }
             }
             '`' => {
@@ -574,6 +603,40 @@ fn canonical_js(text: &str) -> String {
         }
     }
     out
+}
+
+/// Whether a `/` following the canonical text `out` starts a regular-expression
+/// literal rather than a division: at the start of an expression, after an
+/// operator or opening punctuation, or after a keyword that takes an operand.
+fn regex_may_start(out: &str) -> bool {
+    let prev = out.trim_end();
+    match prev.chars().last() {
+        None => true,
+        Some(c) if "(,=:[!&|?{};+-*%<>~^".contains(c) => true,
+        Some(c) if c.is_alphanumeric() || c == '_' || c == '$' => {
+            let word_start = prev
+                .rfind(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '$'))
+                .map_or(0, |i| i + 1);
+            matches!(
+                &prev[word_start..],
+                "return"
+                    | "typeof"
+                    | "instanceof"
+                    | "in"
+                    | "of"
+                    | "new"
+                    | "delete"
+                    | "void"
+                    | "throw"
+                    | "case"
+                    | "do"
+                    | "else"
+                    | "yield"
+                    | "await"
+            )
+        }
+        _ => false,
+    }
 }
 
 /// The exported payload after the component name: the initializer of a
@@ -1188,6 +1251,66 @@ mod semantic_payload_tests {
         assert_eq!(
             tree("export const t  =  1 +  2")["structural_hash"],
             tree("export const t = 1 + 2")["structural_hash"]
+        );
+    }
+
+    #[test]
+    fn export_value_literal_backslash_differs_from_escape() {
+        // Issue #9: `'\\n'` (backslash + n) and `'\n'` (newline) differ at runtime.
+        let (old, new) = pair("export const t = '\\\\n'\n", "export const t = '\\n'\n");
+        let (a, b) = (
+            &old["children"][0]["children"][0],
+            &new["children"][0]["children"][0],
+        );
+        assert_eq!(a["label"], "\"\\\\n\"");
+        assert_eq!(b["label"], "\"\\n\"");
+        assert_ne!(old["structural_hash"], new["structural_hash"]);
+        // Unsupported escapes stay distinguishable from an escaped backslash.
+        assert_ne!(
+            tree("export const t = '\\q'")["structural_hash"],
+            tree("export const t = '\\\\q'")["structural_hash"]
+        );
+        // Quote style alone is still equivalent.
+        for (a, b) in [
+            ("export const t = '\\n'", "export const t = \"\\n\""),
+            ("export const t = '\\\\n'", "export const t = \"\\\\n\""),
+            ("export const t = '\\q'", "export const t = \"\\q\""),
+        ] {
+            assert_eq!(
+                tree(a)["structural_hash"],
+                tree(b)["structural_hash"],
+                "{a} / {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_value_regex_literal_whitespace_is_significant() {
+        // Issue #10: whitespace inside a regular-expression literal matters.
+        let (old, new) = pair(
+            "export const pattern = /a  b/\n",
+            "export const pattern = /a b/\n",
+        );
+        assert_eq!(old["children"][0]["children"][0]["label"], "/a  b/");
+        assert_eq!(new["children"][0]["children"][0]["label"], "/a b/");
+        assert_ne!(old["structural_hash"], new["structural_hash"]);
+        // Escaped slashes and character classes do not end the literal.
+        assert_eq!(
+            tree("export const p = /[/ ]  \\/  x/g")["children"][0]["children"][0]["label"],
+            "/[/ ]  \\/  x/g"
+        );
+        assert_eq!(
+            tree("export const p = f(/a  b/)")["children"][0]["children"][0]["label"],
+            "f(/a  b/)"
+        );
+        // Layout outside the literal stays non-semantic, and division is not a regex.
+        assert_eq!(
+            tree("export const p =   /a  b/.test(x   )")["structural_hash"],
+            tree("export const p = /a  b/.test(x )")["structural_hash"]
+        );
+        assert_eq!(
+            tree("export const r = a  /  b /  c")["structural_hash"],
+            tree("export const r = a / b / c")["structural_hash"]
         );
     }
 
