@@ -490,8 +490,8 @@ fn atx_heading(trimmed: &str) -> Option<(usize, &str)> {
     Some((level, content))
 }
 
-/// Canonical text of a small JavaScript expression: layout outside literals is
-/// collapsed, and simple `'...'`/`"..."` string literals are re-emitted with
+/// Canonical text of a small JavaScript expression: layout outside literals
+/// (strings, templates and regular expressions) is collapsed, and simple `'...'`/`"..."` string literals are re-emitted with
 /// double quotes so equivalent quote spellings compare equal. Literal contents,
 /// operators and other tokens are retained verbatim.
 fn canonical_js(text: &str) -> String {
@@ -559,6 +559,32 @@ fn canonical_js(text: &str) -> String {
                     out.push_str(&raw);
                 }
             }
+            '/' if regex_may_start(&out) => {
+                // A regular-expression literal: its body (including
+                // whitespace) is copied verbatim up to the closing `/`
+                // outside a character class.
+                out.push(ch);
+                let mut escaped = false;
+                let mut in_class = false;
+                while let Some(&c) = chars.peek() {
+                    if c == '\n' {
+                        break;
+                    }
+                    chars.next();
+                    out.push(c);
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '[' {
+                        in_class = true;
+                    } else if c == ']' {
+                        in_class = false;
+                    } else if c == '/' && !in_class {
+                        break;
+                    }
+                }
+            }
             '`' => {
                 out.push(ch);
                 let mut escaped = false;
@@ -577,6 +603,40 @@ fn canonical_js(text: &str) -> String {
         }
     }
     out
+}
+
+/// Whether a `/` following the canonical text `out` starts a regular-expression
+/// literal rather than a division: at the start of an expression, after an
+/// operator or opening punctuation, or after a keyword that takes an operand.
+fn regex_may_start(out: &str) -> bool {
+    let prev = out.trim_end();
+    match prev.chars().last() {
+        None => true,
+        Some(c) if "(,=:[!&|?{};+-*%<>~^".contains(c) => true,
+        Some(c) if c.is_alphanumeric() || c == '_' || c == '$' => {
+            let word_start = prev
+                .rfind(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '$'))
+                .map_or(0, |i| i + 1);
+            matches!(
+                &prev[word_start..],
+                "return"
+                    | "typeof"
+                    | "instanceof"
+                    | "in"
+                    | "of"
+                    | "new"
+                    | "delete"
+                    | "void"
+                    | "throw"
+                    | "case"
+                    | "do"
+                    | "else"
+                    | "yield"
+                    | "await"
+            )
+        }
+        _ => false,
+    }
 }
 
 /// The exported payload after the component name: the initializer of a
@@ -1222,6 +1282,36 @@ mod semantic_payload_tests {
                 "{a} / {b}"
             );
         }
+    }
+
+    #[test]
+    fn export_value_regex_literal_whitespace_is_significant() {
+        // Issue #10: whitespace inside a regular-expression literal matters.
+        let (old, new) = pair(
+            "export const pattern = /a  b/\n",
+            "export const pattern = /a b/\n",
+        );
+        assert_eq!(old["children"][0]["children"][0]["label"], "/a  b/");
+        assert_eq!(new["children"][0]["children"][0]["label"], "/a b/");
+        assert_ne!(old["structural_hash"], new["structural_hash"]);
+        // Escaped slashes and character classes do not end the literal.
+        assert_eq!(
+            tree("export const p = /[/ ]  \\/  x/g")["children"][0]["children"][0]["label"],
+            "/[/ ]  \\/  x/g"
+        );
+        assert_eq!(
+            tree("export const p = f(/a  b/)")["children"][0]["children"][0]["label"],
+            "f(/a  b/)"
+        );
+        // Layout outside the literal stays non-semantic, and division is not a regex.
+        assert_eq!(
+            tree("export const p =   /a  b/.test(x   )")["structural_hash"],
+            tree("export const p = /a  b/.test(x )")["structural_hash"]
+        );
+        assert_eq!(
+            tree("export const r = a  /  b /  c")["structural_hash"],
+            tree("export const r = a / b / c")["structural_hash"]
+        );
     }
 
     #[test]
