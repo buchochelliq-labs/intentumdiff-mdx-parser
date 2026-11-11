@@ -509,7 +509,11 @@ fn canonical_js(text: &str) -> String {
         pending_space = false;
         match ch {
             '\'' | '"' => {
-                let mut value = String::new();
+                // Re-encode the literal as a double-quoted string while
+                // decoding it, so quote spelling is normalized but every
+                // distinct runtime value (and every unsupported escape, kept
+                // in source form) stays distinct.
+                let mut encoded = String::from('"');
                 let mut closed = false;
                 let mut raw = String::from(ch);
                 while let Some(c) = chars.next() {
@@ -523,35 +527,34 @@ fn canonical_js(text: &str) -> String {
                             Some(e) => {
                                 raw.push(e);
                                 match e {
-                                    '\\' | '\'' | '"' => value.push(e),
-                                    'n' => value.push('\n'),
-                                    't' => value.push('\t'),
-                                    'r' => value.push('\r'),
+                                    '\\' => encoded.push_str("\\\\"),
+                                    '"' => encoded.push_str("\\\""),
+                                    '\'' => encoded.push('\''),
+                                    'n' => encoded.push_str("\\n"),
+                                    't' => encoded.push_str("\\t"),
+                                    'r' => encoded.push_str("\\r"),
                                     _ => {
                                         // Keep other escapes in source form.
-                                        value.push('\\');
-                                        value.push(e);
+                                        encoded.push('\\');
+                                        encoded.push(e);
                                     }
                                 }
                             }
                             None => break,
                         }
                     } else {
-                        value.push(c);
+                        match c {
+                            '"' => encoded.push_str("\\\""),
+                            '\n' => encoded.push_str("\\n"),
+                            '\t' => encoded.push_str("\\t"),
+                            '\r' => encoded.push_str("\\r"),
+                            _ => encoded.push(c),
+                        }
                     }
                 }
                 if closed {
-                    out.push('"');
-                    for c in value.chars() {
-                        match c {
-                            '"' => out.push_str("\\\""),
-                            '\n' => out.push_str("\\n"),
-                            '\t' => out.push_str("\\t"),
-                            '\r' => out.push_str("\\r"),
-                            _ => out.push(c),
-                        }
-                    }
-                    out.push('"');
+                    encoded.push('"');
+                    out.push_str(&encoded);
                 } else {
                     out.push_str(&raw);
                 }
@@ -1189,6 +1192,36 @@ mod semantic_payload_tests {
             tree("export const t  =  1 +  2")["structural_hash"],
             tree("export const t = 1 + 2")["structural_hash"]
         );
+    }
+
+    #[test]
+    fn export_value_literal_backslash_differs_from_escape() {
+        // Issue #9: `'\\n'` (backslash + n) and `'\n'` (newline) differ at runtime.
+        let (old, new) = pair("export const t = '\\\\n'\n", "export const t = '\\n'\n");
+        let (a, b) = (
+            &old["children"][0]["children"][0],
+            &new["children"][0]["children"][0],
+        );
+        assert_eq!(a["label"], "\"\\\\n\"");
+        assert_eq!(b["label"], "\"\\n\"");
+        assert_ne!(old["structural_hash"], new["structural_hash"]);
+        // Unsupported escapes stay distinguishable from an escaped backslash.
+        assert_ne!(
+            tree("export const t = '\\q'")["structural_hash"],
+            tree("export const t = '\\\\q'")["structural_hash"]
+        );
+        // Quote style alone is still equivalent.
+        for (a, b) in [
+            ("export const t = '\\n'", "export const t = \"\\n\""),
+            ("export const t = '\\\\n'", "export const t = \"\\\\n\""),
+            ("export const t = '\\q'", "export const t = \"\\q\""),
+        ] {
+            assert_eq!(
+                tree(a)["structural_hash"],
+                tree(b)["structural_hash"],
+                "{a} / {b}"
+            );
+        }
     }
 
     #[test]
